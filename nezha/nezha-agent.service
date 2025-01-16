@@ -1,0 +1,23 @@
+[Unit]
+Description=哪吒探针监控端
+ConditionFileIsExecutable=/opt/nezha/agent/nezha-agent
+
+
+[Service]
+StartLimitInterval=5
+StartLimitBurst=10
+ExecStart=/opt/nezha/agent/nezha-agent "-s" "47.238.179.116:5555" "-p" "EUpC0mXf7C57Bd1SAd" "--disable-auto-update" "--disable-command-execute"
+
+WorkingDirectory=/root
+
+
+
+
+
+Restart=always
+
+RestartSec=120
+EnvironmentFile=-/etc/sysconfig/nezha-agent
+
+[Install]
+WantedBy=multi-user.target
