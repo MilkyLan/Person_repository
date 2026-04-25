@@ -3,15 +3,13 @@
 通用直播录像上传脚本 (合并自 kelie_upload.py + kelie_rclone.py)
 
 多主播共用,在各自 systemd service 的 ExecStart 里传入不同参数即可。
-功能:
-  1. 监控 {base_dir}/upload 目录,用 biliup-rs 将 flv/mp4 投稿到 B 站
-     (同一场直播自动 append 分 P)
-  2. 上传成功后按 --post-action 处理本地文件:
-        rclone  => 通过 rclone 模块同步到云端
-        delete  => 直接删除
-        backup  => 移动到 {base_dir}/backup/{date}
-  3. 每天定时清空 upload 日志以开启新的一场
-  4. backup 分区空间不足时自动删除最老备份
+
+四种运行模式 (--mode):
+  upload       上传 B 站后按日期移到 backup/{date}/;backup 分区可用空间不足时
+               自动删除最老一天备份(阈值由 --cleanup-threshold 控制,默认 20%)
+  upload-only  仅上传 B 站,完成后删除本地文件
+  rclone       上传 B 站完成后再 rclone 备份到云端(rclone move,本地随之消失)
+  rclone-only  跳过 B 站,仅把 upload/ 内文件 rclone 备份到云端
 """
 
 from __future__ import annotations
@@ -43,11 +41,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--up", required=True, help="主播英文标识(日志用)")
     p.add_argument("--up-name", required=True, help="主播中文名(标题用)")
     p.add_argument("--base-dir", required=True,
-                   help="主播工作目录,内含 upload/ backup/ 及各类 log")
+                   help="主播工作目录,内含 upload/ 及各类 log")
 
-    # B 站投稿
-    p.add_argument("--cookie", required=True, help="biliup-rs cookie 文件路径")
-    p.add_argument("--tag", required=True, help="稿件标签,逗号分隔")
+    # 运行模式
+    p.add_argument("--mode",
+                   choices=["upload", "upload-only", "rclone", "rclone-only"],
+                   default="upload",
+                   help="upload: 上传后按日期备份到 backup/(空间不足自动删最老备份); "
+                        "upload-only: 仅上传,完成后删除本地; "
+                        "rclone: 上传后 rclone 备份到云端; "
+                        "rclone-only: 跳过 B 站,仅 rclone 备份")
+
+    # B 站投稿 (upload / upload-only / rclone 模式必填)
+    p.add_argument("--cookie", default="", help="biliup-rs cookie 文件路径")
+    p.add_argument("--tag", default="", help="稿件标签,逗号分隔")
     p.add_argument("--desc", default="", help="稿件简介")
     p.add_argument("--source", default="", help="转载来源(copyright=2 生效)")
     p.add_argument("--tid", type=int, default=171, help="分区 tid,默认 171")
@@ -61,22 +68,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--title-suffix", default="",
                    help="标题后缀,常用于游戏名(如 '永劫无间')")
 
-    # 上传后动作
-    p.add_argument("--post-action", choices=["rclone", "delete", "backup"],
-                   default="backup",
-                   help="上传成功后的处理: rclone / delete / backup (默认 backup)")
-
-    # rclone 模块
+    # rclone (rclone / rclone-only 模式必填)
     p.add_argument("--rclone-zone", default="",
-                   help="rclone 远端空间名(post-action=rclone 时必填)")
+                   help="rclone 远端空间名")
     p.add_argument("--rclone-chunk-size", default="100M",
                    help="rclone --onedrive-chunk-size,默认 100M")
     p.add_argument("--rclone-extra", default="",
                    help="追加到 rclone 命令末尾的额外参数")
 
-    # 磁盘清理
-    p.add_argument("--cleanup-threshold", type=float, default=0,
-                   help="backup 分区可用空间低于此百分比时删最老备份(0 关闭)")
+    # backup 磁盘清理 (mode=upload 时生效)
+    p.add_argument("--cleanup-threshold", type=float, default=20.0,
+                   help="backup 分区可用空间低于此百分比时删最老备份;0 关闭(默认 20)")
 
     # 循环
     p.add_argument("--interval", type=int, default=30, help="主循环间隔秒数")
@@ -85,8 +87,15 @@ def parse_args() -> argparse.Namespace:
 
     cfg = p.parse_args()
 
-    if cfg.post_action == "rclone" and not cfg.rclone_zone:
-        p.error("--post-action rclone 需要同时指定 --rclone-zone")
+    needs_bili = cfg.mode in ("upload", "upload-only", "rclone")
+    needs_rclone = cfg.mode in ("rclone", "rclone-only")
+
+    if needs_bili:
+        missing = [k for k in ("cookie", "tag") if not getattr(cfg, k)]
+        if missing:
+            p.error(f"mode={cfg.mode} 需要参数: {', '.join('--' + m for m in missing)}")
+    if needs_rclone and not cfg.rclone_zone:
+        p.error(f"mode={cfg.mode} 需要 --rclone-zone")
 
     return cfg
 
@@ -191,23 +200,35 @@ def build_append_cmd(cfg, media: str, bvid: str) -> str:
 
 # ---------------- rclone 模块 ----------------
 
+def rclone_remote_path(zone: str, sub: str) -> str:
+    """组合 rclone 远端路径,兼容两种写法:
+       - 'remote'                       -> 'remote:/sub'
+       - 'remote:/already/some/path'    -> 'remote:/already/some/path/sub'
+    """
+    if ":" in zone:
+        return zone.rstrip("/") + "/" + sub
+    return f"{zone}:/{sub}"
+
+
 def rclone_sync(cfg, live_date: str, files: list, rclone_log: str) -> bool:
-    """把若干本地文件 move 到 {rclone_zone}:/{live_date}"""
+    """把若干本地文件 move 到 {rclone_zone}/{live_date}"""
     if not cfg.rclone_zone:
         logging.error("rclone 未启用(--rclone-zone 为空),跳过")
         return False
 
+    remote = rclone_remote_path(cfg.rclone_zone, live_date)
+
     # 首次同步本场直播时创建远端目录并建立 rclone.log 锚点
     if not os.path.exists(rclone_log):
         open(rclone_log, "w").close()
-        run(f"rclone mkdir {cfg.rclone_zone}:/{live_date}", rclone_log)
+        run(f'rclone mkdir "{remote}"', rclone_log)
 
     extra = f" {cfg.rclone_extra}" if cfg.rclone_extra else ""
     ok = True
     for f in files:
         if not os.path.exists(f):
             continue
-        cmd = (f'rclone move "{f}" "{cfg.rclone_zone}:/{live_date}" '
+        cmd = (f'rclone move "{f}" "{remote}" '
                f'--onedrive-chunk-size {cfg.rclone_chunk_size}{extra}')
         if run(cmd, rclone_log) != 0:
             logging.error(f"rclone move 失败: {f}")
@@ -218,23 +239,44 @@ def rclone_sync(cfg, live_date: str, files: list, rclone_log: str) -> bool:
 # ---------------- 上传后动作 ----------------
 
 def post_upload(cfg, paths, live_date: str, files: list):
-    action = cfg.post_action
-    if action == "delete":
+    """根据 cfg.mode 处理上传完成后的本地文件"""
+    if cfg.mode == "rclone":
+        rclone_sync(cfg, live_date, files, paths["rclone_log"])
+    elif cfg.mode == "upload-only":
         remove_files(files, reason="上传完成")
-
-    elif action == "backup":
+    else:  # upload -> backup/{date}/
         dest = os.path.join(paths["backup"], live_date)
         os.makedirs(dest, exist_ok=True)
         for f in files:
-            if os.path.exists(f):
-                logging.info(f"移动到 backup: {f} -> {dest}")
+            if not os.path.exists(f):
+                continue
+            logging.info(f"移到 backup: {f} ({fmt_size(f)}) -> {dest}")
+            try:
                 shutil.move(f, dest)
-
-    elif action == "rclone":
-        rclone_sync(cfg, live_date, files, paths["rclone_log"])
+            except OSError as e:
+                logging.error(f"backup 移动失败 {f}: {e}")
 
 
 # ---------------- 主流程 ----------------
+
+def process_rclone_only(cfg, paths):
+    """rclone-only 模式: 不投稿 B 站,直接把 upload/ 内文件 rclone 到 {zone}:/{date}"""
+    upload_dir = paths["upload"]
+    if not os.path.isdir(upload_dir):
+        return
+    today = datetime.now().strftime("%Y-%m-%d")
+    for name in sorted(os.listdir(upload_dir)):
+        full = os.path.join(upload_dir, name)
+        if not os.path.isfile(full):
+            continue
+        m = re.search(r"(\d{4}-\d{2}-\d{2})", name)
+        live_date = m.group(1) if m else today
+        logging.info(
+            f"⤴ rclone 同步 {full} ({fmt_size(full)}) -> "
+            f"{rclone_remote_path(cfg.rclone_zone, live_date)}"
+        )
+        rclone_sync(cfg, live_date, [full], paths["rclone_log"])
+
 
 def process_media(cfg, paths, ext: str, log_path: str, title_fmt: str):
     upload_dir = paths["upload"]
@@ -325,15 +367,18 @@ def check_and_cleanup(backup_dir: str, threshold: float):
     oldest = find_oldest_subdir(backup_dir)
     if oldest:
         logging.warning(f"删除最老备份: {oldest}")
-        shutil.rmtree(oldest)
+        shutil.rmtree(oldest, ignore_errors=True)
 
 
 def main_loop(cfg, paths):
     try:
-        process_media(cfg, paths, ".mp4", paths["danmu_log"],
-                      "【{up}丨弹幕版】{date} 录播")
-        process_media(cfg, paths, ".flv", paths["upload_log"],
-                      "【{up}】{date} 录播")
+        if cfg.mode == "rclone-only":
+            process_rclone_only(cfg, paths)
+        else:
+            process_media(cfg, paths, ".mp4", paths["danmu_log"],
+                          "【{up}丨弹幕版】{date} 录播")
+            process_media(cfg, paths, ".flv", paths["upload_log"],
+                          "【{up}】{date} 录播")
     except Exception as e:
         logging.exception(f"处理错误: {e}")
 
@@ -342,7 +387,7 @@ def main_loop(cfg, paths):
     except Exception as e:
         logging.exception(f"日志重置错误: {e}")
 
-    if cfg.cleanup_threshold > 0:
+    if cfg.mode == "upload" and cfg.cleanup_threshold > 0:
         try:
             check_and_cleanup(paths["backup"], cfg.cleanup_threshold)
         except Exception as e:
@@ -353,15 +398,21 @@ def main():
     cfg = parse_args()
     paths = build_paths(cfg)
     os.makedirs(paths["upload"], exist_ok=True)
-    os.makedirs(paths["backup"], exist_ok=True)
+    if cfg.mode == "upload":
+        os.makedirs(paths["backup"], exist_ok=True)
 
     logging.basicConfig(
         filename=paths["main_log"],
         level=logging.INFO,
         format="%(asctime)s:%(levelname)s:%(message)s",
     )
-    logging.info(f"=== 启动 {cfg.up}({cfg.up_name}) "
-                 f"post-action={cfg.post_action} ===")
+    if cfg.mode in ("rclone", "rclone-only"):
+        extra = f" zone={cfg.rclone_zone}"
+    elif cfg.mode == "upload":
+        extra = f" cleanup-threshold={cfg.cleanup_threshold}%"
+    else:
+        extra = ""
+    logging.info(f"=== 启动 {cfg.up}({cfg.up_name}) mode={cfg.mode}{extra} ===")
 
     while True:
         time.sleep(cfg.interval)
