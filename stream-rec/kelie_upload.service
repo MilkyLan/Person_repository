@@ -1,0 +1,32 @@
+[Unit]                                                    
+Description=Stream-Rec Upload - 克烈                                                                                                                                                       
+After=network.target
+                                                                                                                                                                                              
+[Service]                                                 
+    Type=simple
+    ExecStart=/usr/bin/python3 /opt/stream-rec/stream_uploader.py \
+      --up kelie \
+      --up-name 克烈 \
+      --base-dir /opt/stream-rec/克烈 \
+      --cookie /opt/stream-rec/cookies-qn.json \
+      --tag "游戏,永劫无间,克烈,心地善良克烈王,录播,直播回放" \
+      --desc "克烈直播间https://live.douyin.com/999146174230" \
+      --biliup-bin /opt/stream-rec/biliup-rs \
+      --title-suffix 永劫无间 \
+      --tid 171 \
+      --copyright 1 \
+      --line txa \
+      --limit 10 \
+      --post-action delete \
+      --interval 30 \
+      --reset-time 08:00
+
+
+
+Restart=always                                                                                                                                                                              
+RestartSec=10
+User=root                                                                                                                                                                                   
+Group=root                                                
+
+[Install]
+WantedBy=multi-user.target
