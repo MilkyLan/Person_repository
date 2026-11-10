@@ -1,0 +1,31 @@
+[Unit]
+Description=Stream-Rec Upload - 克烈
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/stream-rec/stream_upload.py \
+  --up-name 克烈 \
+  --base-dir /opt/rust-srec/output/克烈 \
+  --mode upload-backup \
+  --no-upload-flv \
+  --encode-danmaku \
+  --cookie /opt/stream-rec/cookies-qn.json \
+  --tag "游戏,永劫无间,克烈,麻辣毛蛋,心地善良克烈王,录播,直播回放" \
+  --desc "克烈直播间https://live.douyin.com/999146174230" \
+  --title-suffix "直播回放 永劫无间" \
+  --tid 171 \
+  --copyright 1 \
+  --line tx \
+  # --limit 10 \
+  --interval 30 \
+  --reset-time 08:00 \
+  --font "MiSans" \
+  --denylist /opt/stream-rec/denylist.txt
+
+
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
